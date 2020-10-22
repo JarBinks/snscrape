@@ -1,41 +1,87 @@
 import bs4
 import collections
+import dataclasses
 import datetime
 import itertools
+import json
 import logging
+import re
 import snscrape.base
 import typing
 import urllib.parse
+try:
+	import zoneinfo
+except ImportError:
+	# Python 3.8 support; nowadays, Europe/Moscow is always UTC+3, but it's more complicated before 2014, so need proper zone info
+	import pytz
+	def timezone(s):
+		return pytz.timezone(s)
+	def localised_datetime(tz, *args, **kwargs):
+		return tz.localize(datetime.datetime(*args, **kwargs))
+else:
+	def timezone(s):
+		return zoneinfo.ZoneInfo(s)
+	def localised_datetime(tz, *args, **kwargs):
+		return datetime.datetime(*args, tzinfo = tz, **kwargs)
 
 
 logger = logging.getLogger(__name__)
 
 
-class VKontaktePost(typing.NamedTuple, snscrape.base.Item):
+@dataclasses.dataclass
+class VKontaktePost(snscrape.base.Item):
 	url: str
-	date: datetime.datetime
+	date: typing.Optional[typing.Union[datetime.datetime, datetime.date]]
 	content: str
+	outlinks: typing.Optional[typing.List[str]] = None
+	photos: typing.Optional[typing.List['Photo']] = None
+	video: typing.Optional['Video'] = None
+	quotedPost: typing.Optional['VKontaktePost'] = None
 
 	def __str__(self):
 		return self.url
 
 
-class User(typing.NamedTuple, snscrape.base.Entity):
+@dataclasses.dataclass
+class Photo:
+	variants: typing.List['PhotoVariant']
+	url: typing.Optional[str] = None
+
+
+@dataclasses.dataclass
+class PhotoVariant:
+	url: str
+	width: int
+	height: int
+
+
+@dataclasses.dataclass
+class Video:
+	id: str
+	list: str
+	duration: int
+	url: str
+	thumbUrl: str
+
+
+@dataclasses.dataclass
+class User(snscrape.base.Entity):
 	username: str
 	name: str
 	verified: bool
 	description: typing.Optional[str] = None
 	websites: typing.Optional[typing.List[str]] = None
-	followers: typing.Optional[int] = None
-	followersGranularity: typing.Optional[snscrape.base.Granularity] = None
-	posts: typing.Optional[int] = None
-	postsGranularity: typing.Optional[snscrape.base.Granularity] = None
-	photos: typing.Optional[int] = None
-	photosGranularity: typing.Optional[snscrape.base.Granularity] = None
-	tags: typing.Optional[int] = None
-	tagsGranularity: typing.Optional[snscrape.base.Granularity] = None
-	following: typing.Optional[int] = None
-	followingGranularity: typing.Optional[snscrape.base.Granularity] = None
+	followers: typing.Optional[snscrape.base.IntWithGranularity] = None
+	posts: typing.Optional[snscrape.base.IntWithGranularity] = None
+	photos: typing.Optional[snscrape.base.IntWithGranularity] = None
+	tags: typing.Optional[snscrape.base.IntWithGranularity] = None
+	following: typing.Optional[snscrape.base.IntWithGranularity] = None
+
+	followersGranularity = snscrape.base._DeprecatedProperty('followersGranularity', lambda self: self.followers.granularity, 'followers.granularity')
+	postsGranularity = snscrape.base._DeprecatedProperty('postsGranularity', lambda self: self.posts.granularity, 'posts.granularity')
+	photosGranularity = snscrape.base._DeprecatedProperty('photosGranularity', lambda self: self.photos.granularity, 'photos.granularity')
+	tagsGranularity = snscrape.base._DeprecatedProperty('tagsGranularity', lambda self: self.tags.granularity, 'tags.granularity')
+	followingGranularity = snscrape.base._DeprecatedProperty('followingGranularity', lambda self: self.following.granularity, 'following.granularity')
 
 	def __str__(self):
 		return f'https://vk.com/{self.username}'
@@ -52,15 +98,115 @@ class VKontakteUserScraper(snscrape.base.Scraper):
 		self._initialPage = None
 		self._initialPageSoup = None
 
-	def _post_div_to_item(self, post):
-		url = urllib.parse.urljoin(self._baseUrl, post.find('a', class_ = 'post_link')['href'])
-		assert url.startswith('https://vk.com/wall') and '_' in url and url[-1] != '_' and url.rsplit('_', 1)[1].strip('0123456789') == ''
-		dateSpan = post.find('div', class_ = 'post_date').find('span', class_ = 'rel_date')
+	def _away_a_to_url(self, a):
+		# Transform an <a> tag with an href of /away.php?to=... to a plain URL; returns None if a doesn't have that form.
+		if a and a.get('href', '').startswith('/away.php?to='):
+			end = a['href'].find('&', 13)
+			if end == -1:
+				end = None
+			return urllib.parse.unquote(a['href'][13 : end])
+		return None
+
+	def _date_span_to_date(self, dateSpan):
+		if not dateSpan:
+			return None
+		if 'time' in dateSpan.attrs:
+			return datetime.datetime.fromtimestamp(int(dateSpan['time']), datetime.timezone.utc)
+		months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+		if (match := re.match(r'^(?P<date>today|yesterday|(?P<day1>\d+)\s+(?P<month1>' + '|'.join(months) + ')|(?P<month2>' + '|'.join(months) + r')\s+(?P<day2>\d+),\s+(?P<year2>\d{4}))\s+at\s+(?P<hour>\d+):(?P<minute>\d+)\s+(?P<ampm>[ap]m)$', dateSpan.text)):
+			# Datetime information down to minutes
+			tz = timezone('Europe/Moscow')
+			if match.group('date') in ('today', 'yesterday'):
+				date = datetime.datetime.now(tz = tz)
+				if match.group('date') == 'yesterday':
+					date -= datetime.timedelta(days = 1)
+				year, month, day = date.year, date.month, date.day
+			else:
+				year = int(match.group('year2') or datetime.datetime.now(tz = tz).year)
+				month = months.index(match.group('month1') or match.group('month2')) + 1
+				day = int(match.group('day1') or match.group('day2'))
+			hour = int(match.group('hour'))
+			# Damn AM/PM...
+			if hour == 12:
+				hour -= 12
+			if match.group('ampm') == 'pm':
+				hour += 12
+			minute = int(match.group('minute'))
+			return localised_datetime(tz, year, month, day, hour, minute)
+		if (match := re.match(r'^(?P<day>\d+)\s+(?P<month>' + '|'.join(months) + r')\s+(?P<year>\d{4})$', dateSpan.text)):
+			# Date only
+			return datetime.date(int(match.group('year')), months.index(match.group('month')) + 1, int(match.group('day')))
+		if dateSpan.text != 'video': # Silently ignore video reposts which have no original date attached
+			logger.warning(f'Could not parse date string: {dateSpan.text!r}')
+
+	def _post_div_to_item(self, post, isCopy = False):
+		url = urllib.parse.urljoin(self._baseUrl, post.find('a', class_ = 'post_link' if not isCopy else 'published_by_date')['href'])
+		assert (url.startswith('https://vk.com/wall') or isCopy and url.startswith('https://vk.com/video')) and '_' in url and url[-1] != '_' and url.rsplit('_', 1)[1].strip('0123456789') == ''
+		if not isCopy:
+			dateSpan = post.find('div', class_ = 'post_date').find('span', class_ = 'rel_date')
+		else:
+			dateSpan = post.find('div', class_ = 'copy_post_date').find('a', class_ = 'published_by_date')
 		textDiv = post.find('div', class_ = 'wall_post_text')
+		outlinks = [h for a in textDiv.find_all('a') if (h := self._away_a_to_url(a))] if textDiv else []
+		if (mediaLinkDiv := post.find('div', class_ = 'media_link')) and \
+		   (mediaLinkA := mediaLinkDiv.find('a', class_ = 'media_link__title')) and \
+		   (href := self._away_a_to_url(mediaLinkA)) and \
+		   href not in outlinks:
+			outlinks.append(href)
+		photos = None
+		video = None
+		if (thumbsDiv := (post.find('div', class_ = 'wall_text') if not isCopy else post).find('div', class_ = 'page_post_sized_thumbs')) and \
+		   not (not isCopy and thumbsDiv.parent.name == 'div' and 'class' in thumbsDiv.parent.attrs and 'copy_quote' in thumbsDiv.parent.attrs['class']): # Skip post quotes
+			photos = []
+			for a in thumbsDiv.find_all('a', class_ = 'page_post_thumb_wrap'):
+				if 'data-photo-id' not in a.attrs and 'data-video' not in a.attrs:
+					logger.warning(f'Skipping non-photo and non-video thumb wrap on {url}')
+					continue
+				if 'data-video' in a.attrs:
+					# Video
+					video = Video(
+						id = a['data-video'],
+						list = a['data-list'],
+						duration = int(a['data-duration']),
+						url = f'https://vk.com{a["href"]}',
+						thumbUrl = a['style'][(begin := a['style'].find('background-image: url(') + 22) : a['style'].find(')', begin)],
+					)
+					continue
+				# From here on: photo
+				if 'onclick' not in a.attrs or not a['onclick'].startswith("return showPhoto('") or '{"temp":' not in a['onclick'] or not a['onclick'].endswith('}, event)'):
+					logger.warning(f'Photo thumb wrap on {url} has no or unexpected onclick, skipping')
+					continue
+				photoData = a['onclick'][a['onclick'].find('{"temp":') : -8] # -8 = len(', event)')
+				photoObj = json.loads(photoData)
+				singleLetterKeys = [k for k in photoObj['temp'].keys() if len(k) == 1 and 97 <= ord(k) <= 122] # 97 = ord('a'), 122 = ord('z')
+				for x in singleLetterKeys:
+					# Merge base into URLs
+					if not photoObj['temp'][x].startswith('https://'):
+						photoObj['temp'][x] = f'{photoObj["temp"]["base"]}{photoObj["temp"][x]}'
+					x_ = f'{x}_'
+					if not photoObj['temp'][x_][0].startswith('https://'):
+						photoObj['temp'][x_][0] = f'{photoObj["temp"]["base"]}{photoObj["temp"][x_][0]}'
+				if any(k not in {'base', 'w', 'w_', 'x', 'x_', 'y', 'y_', 'z', 'z_'} for k in photoObj['temp'].keys()) or \
+				   not all(photoObj['temp'][x] in (photoObj['temp'][f'{x}_'][0], photoObj['temp'][f'{x}_'][0] + '.jpg') for x in singleLetterKeys) or \
+				   not all(photoObj['temp'][x].startswith('https://sun') and '.userapi.com/' in photoObj['temp'][x] for x in singleLetterKeys) or \
+				   not all(len(photoObj['temp'][(x_ := f'{x}_')]) == 3 and isinstance(photoObj['temp'][x_][1], int) and isinstance(photoObj['temp'][x_][2], int) for x in singleLetterKeys):
+					logger.warning(f'Photo thumb wrap on {url} has unexpected data structure, skipping')
+					continue
+				photoVariants = []
+				for x in singleLetterKeys:
+					x_ = f'{x}_'
+					photoVariants.append(PhotoVariant(url = f'{photoObj["temp"][x_][0]}.jpg' if '.jpg' not in photoObj['temp'][x_][0] else photoObj['temp'][x_][0], width = photoObj['temp'][x_][1], height = photoObj['temp'][x_][2]))
+				photoUrl = f'https://vk.com{a["href"]}' if 'href' in a.attrs and a['href'].startswith('/photo') and a['href'][6:].strip('0123456789-_') == '' else None
+				photos.append(Photo(variants = photoVariants, url = photoUrl))
+		quotedPost = self._post_div_to_item(quoteDiv, isCopy = True) if (quoteDiv := post.find('div', class_ = 'copy_quote')) else None
 		return VKontaktePost(
 		  url = url,
-		  date = datetime.datetime.fromtimestamp(int(dateSpan['time']), datetime.timezone.utc) if 'time' in dateSpan else None,
+		  date = self._date_span_to_date(dateSpan),
 		  content = textDiv.text if textDiv else None,
+		  outlinks = outlinks or None,
+		  photos = photos or None,
+		  video = video or None,
+		  quotedPost = quotedPost,
 		 )
 
 	def _soup_to_items(self, soup):
@@ -97,7 +243,7 @@ class VKontakteUserScraper(snscrape.base.Scraper):
 			logger.info('Wall has no posts')
 			return
 		ownerID = newestPost.attrs['data-post-id'].split('_')[0]
-		# If there is a pinned post, we need its ID for the pagination requests; we also need to keep the post around so it can be inserted into the stream at the right point
+		# If there is a pinned post, we need its ID for the pagination requests
 		if 'post_fixed' in newestPost.attrs['class']:
 			fixedPostID = int(newestPost.attrs['id'].split('_')[1])
 		else:
@@ -201,16 +347,16 @@ class VKontakteUserScraper(snscrape.base.Scraper):
 				if label in ('follower', 'post', 'photo', 'tag'):
 					label = f'{label}s'
 				if label in ('followers', 'posts', 'photos', 'tags'):
-					kwargs[label], kwargs[f'{label}Granularity'] = count, granularity
+					kwargs[label] = snscrape.base.IntWithGranularity(count, granularity)
 
 		if (idolsDiv := soup.find('div', id = 'profile_idols')):
 			if (topDiv := idolsDiv.find('div', class_ = 'header_top')) and topDiv.find('span', class_ = 'header_label').text == 'Following':
-				kwargs['following'], kwargs['followingGranularity'] = parse_num(topDiv.find('span', class_ = 'header_count').text)
+				kwargs['following'] = snscrape.base.IntWithGranularity(*parse_num(topDiv.find('span', class_ = 'header_count').text))
 
 		# On public pages, this is where followers are listed
 		if (followersDiv := soup.find('div', id = 'public_followers')):
 			if (topDiv := followersDiv.find('div', class_ = 'header_top')) and topDiv.find('span', class_ = 'header_label').text == 'Followers':
-				kwargs['followers'], kwargs['followersGranularity'] = parse_num(topDiv.find('span', class_ = 'header_count').text)
+				kwargs['followers'] = snscrape.base.IntWithGranularity(*parse_num(topDiv.find('span', class_ = 'header_count').text))
 
 		return User(**kwargs)
 

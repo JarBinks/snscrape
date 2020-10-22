@@ -1,15 +1,19 @@
 import bs4
+import dataclasses
 import datetime
 import logging
+import re
 import snscrape.base
 import typing
 import urllib.parse
 
 
 logger = logging.getLogger(__name__)
+_SINGLE_MEDIA_LINK_PATTERN = re.compile(r'^https://t\.me/[^/]+/\d+\?single$')
 
 
-class LinkPreview(typing.NamedTuple):
+@dataclasses.dataclass
+class LinkPreview:
 	href: str
 	siteName: typing.Optional[str] = None
 	title: typing.Optional[str] = None
@@ -17,33 +21,37 @@ class LinkPreview(typing.NamedTuple):
 	image: typing.Optional[str] = None
 
 
-class TelegramPost(typing.NamedTuple, snscrape.base.Item):
+@dataclasses.dataclass
+class TelegramPost(snscrape.base.Item):
 	url: str
 	date: datetime.datetime
 	content: str
 	outlinks: list
-	outlinksss: str # deprecated, use outlinks instead
 	linkPreview: typing.Optional[LinkPreview] = None
+
+	outlinksss = snscrape.base._DeprecatedProperty('outlinksss', lambda self: ' '.join(self.outlinks), 'outlinks')
 
 	def __str__(self):
 		return self.url
 
 
-class Channel(typing.NamedTuple, snscrape.base.Entity):
+@dataclasses.dataclass
+class Channel(snscrape.base.Entity):
 	username: str
 	title: str
 	verified: bool
 	photo: str
 	description: typing.Optional[str] = None
 	members: typing.Optional[int] = None
-	photos: typing.Optional[int] = None
-	photosGranularity: typing.Optional[snscrape.base.Granularity] = None
-	videos: typing.Optional[int] = None
-	videosGranularity: typing.Optional[snscrape.base.Granularity] = None
-	links: typing.Optional[int] = None
-	linksGranularity: typing.Optional[snscrape.base.Granularity] = None
-	files: typing.Optional[int] = None
-	filesGranularity: typing.Optional[snscrape.base.Granularity] = None
+	photos: typing.Optional[snscrape.base.IntWithGranularity] = None
+	videos: typing.Optional[snscrape.base.IntWithGranularity] = None
+	links: typing.Optional[snscrape.base.IntWithGranularity] = None
+	files: typing.Optional[snscrape.base.IntWithGranularity] = None
+
+	photosGranularity = snscrape.base._DeprecatedProperty('photosGranularity', lambda self: self.photos.granularity, 'photos.granularity')
+	videosGranularity = snscrape.base._DeprecatedProperty('videosGranularity', lambda self: self.videos.granularity, 'videos.granularity')
+	linksGranularity = snscrape.base._DeprecatedProperty('linksGranularity', lambda self: self.links.granularity, 'links.granularity')
+	filesGranularity = snscrape.base._DeprecatedProperty('filesGranularity', lambda self: self.files.granularity, 'files.granularity')
 
 	def __str__(self):
 		return f'https://t.me/s/{self.username}'
@@ -73,7 +81,12 @@ class TelegramChannelScraper(snscrape.base.Scraper):
 			if onlyUsername:
 				yield post['data-post'].split('/')[0]
 				return
-			date = datetime.datetime.strptime(post.find('div', class_ = 'tgme_widget_message_footer').find('a', class_ = 'tgme_widget_message_date').find('time', datetime = True)['datetime'].replace('-', '', 2).replace(':', ''), '%Y%m%dT%H%M%S%z')
+			dateDiv = post.find('div', class_ = 'tgme_widget_message_footer').find('a', class_ = 'tgme_widget_message_date')
+			rawUrl = dateDiv['href']
+			if not rawUrl.startswith('https://t.me/') or sum(x == '/' for x in rawUrl) != 4 or rawUrl.rsplit('/', 1)[1].strip('0123456789') != '':
+				self.logger.warning(f'Possibly incorrect URL: {rawUrl!r}')
+			url = rawUrl.replace('//t.me/', '//t.me/s/')
+			date = datetime.datetime.strptime(dateDiv.find('time', datetime = True)['datetime'].replace('-', '', 2).replace(':', ''), '%Y%m%dT%H%M%S%z')
 			if (message := post.find('div', class_ = 'tgme_widget_message_text')):
 				content = message.text
 				outlinks = []
@@ -81,17 +94,18 @@ class TelegramChannelScraper(snscrape.base.Scraper):
 					if any(x in link.parent.attrs.get('class', []) for x in ('tgme_widget_message_user', 'tgme_widget_message_author')):
 						# Author links at the top (avatar and name)
 						continue
-					if link['href'] == f'https://t.me/{post["data-post"]}':
+					if link['href'] == rawUrl or link['href'] == url:
 						# Generic filter of links to the post itself, catches videos, photos, and the date link
+						continue
+					if _SINGLE_MEDIA_LINK_PATTERN.match(link['href']):
+						# Individual photo or video link
 						continue
 					href = urllib.parse.urljoin(pageUrl, link['href'])
 					if href not in outlinks:
 						outlinks.append(href)
-				outlinksss = ' '.join(outlinks)
 			else:
 				content = None
 				outlinks = []
-				outlinksss = ''
 			linkPreview = None
 			if (linkPreviewA := post.find('a', class_ = 'tgme_widget_message_link_preview')):
 				kwargs = {}
@@ -106,9 +120,9 @@ class TelegramChannelScraper(snscrape.base.Scraper):
 					if imageI['style'].startswith("background-image:url('"):
 						kwargs['image'] = imageI['style'][22 : imageI['style'].index("'", 22)]
 					else:
-						self.logger.warning(f'Could not process link preview image on https://t.me/s/{post["data-post"]}')
+						self.logger.warning(f'Could not process link preview image on {url}')
 				linkPreview = LinkPreview(**kwargs)
-			yield TelegramPost(url = f'https://t.me/s/{post["data-post"]}', date = date, content = content, outlinks = outlinks, outlinksss = outlinksss, linkPreview = linkPreview)
+			yield TelegramPost(url = url, date = date, content = content, outlinks = outlinks, linkPreview = linkPreview)
 
 	def get_items(self):
 		r, soup = self._initial_page()
@@ -173,7 +187,7 @@ class TelegramChannelScraper(snscrape.base.Scraper):
 				# Already extracted more accurately from /channel, skip
 				continue
 			elif type_ in ('photos', 'videos', 'links', 'files'):
-				kwargs[type_], kwargs[f'{type_}Granularity'] = value, granularity
+				kwargs[type_] = snscrape.base.IntWithGranularity(value, granularity)
 
 		return Channel(**kwargs)
 

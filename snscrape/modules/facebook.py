@@ -1,4 +1,5 @@
 import bs4
+import dataclasses
 import datetime
 import json
 import logging
@@ -11,19 +12,22 @@ import urllib.parse
 logger = logging.getLogger(__name__)
 
 
-class FacebookPost(typing.NamedTuple, snscrape.base.Item):
+@dataclasses.dataclass
+class FacebookPost(snscrape.base.Item):
 	cleanUrl: str
 	dirtyUrl: str
 	date: datetime.datetime
 	content: typing.Optional[str]
 	outlinks: list
-	outlinksss: str # deprecated, use outlinks instead
+
+	outlinksss = snscrape.base._DeprecatedProperty('outlinksss', lambda self: ' '.join(self.outlinks), 'outlinks')
 
 	def __str__(self):
 		return self.cleanUrl
 
 
-class User(typing.NamedTuple, snscrape.base.Entity):
+@dataclasses.dataclass
+class User(snscrape.base.Entity):
 	username: str
 	pageId: int
 	name: str
@@ -147,14 +151,14 @@ class FacebookCommonScraper(snscrape.base.Scraper):
 				outlink = query['u'][0]
 				if outlink.startswith('http://') or outlink.startswith('https://') and outlink not in outlinks:
 					outlinks.append(outlink)
-			yield FacebookPost(cleanUrl = cleanUrl, dirtyUrl = dirtyUrl, date = date, content = content, outlinks = outlinks, outlinksss = ' '.join(outlinks))
+			yield FacebookPost(cleanUrl = cleanUrl, dirtyUrl = dirtyUrl, date = date, content = content, outlinks = outlinks)
 
 
 class FacebookUserAndCommunityScraper(FacebookCommonScraper):
 	def __init__(self, username, **kwargs):
 		super().__init__(**kwargs)
 		self._username = username
-		self._headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/39.0.2171.95 Safari/537.36', 'Accept-Language': 'en-US,en;q=0.5'}
+		self._headers = {'User-Agent': 'Mozilla/5.0 (X11; Linux i686; rv:78.0) Gecko/20100101 Firefox/78.0', 'Accept-Language': 'en-US,en;q=0.5'}
 		self._initialPage = None
 		self._initialPageSoup = None
 
@@ -169,8 +173,6 @@ class FacebookUserAndCommunityScraper(FacebookCommonScraper):
 		return self._initialPage, self._initialPageSoup
 
 	def get_items(self):
-		headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/39.0.2171.95 Safari/537.36', 'Accept-Language': 'en-US,en;q=0.5'}
-
 		nextPageLinkPattern = re.compile(r'^/pages_reaction_units/more/\?page_id=')
 		spuriousForLoopPattern = re.compile(r'^for \(;;\);')
 
@@ -185,7 +187,7 @@ class FacebookUserAndCommunityScraper(FacebookCommonScraper):
 
 			# The web app sends a bunch of additional parameters. Most of them would be easy to add, but there's also __dyn, which is a compressed list of the "modules" loaded in the browser.
 			# Reproducing that would be difficult to get right, especially as Facebook's codebase evolves, so it's just not sent at all here.
-			r = self._get(urllib.parse.urljoin(self._baseUrl, nextPageLink.get('ajaxify')) + '&__a=1', headers = headers)
+			r = self._get(urllib.parse.urljoin(self._baseUrl, nextPageLink.get('ajaxify')) + '&__a=1', headers = self._headers)
 			if r.status_code != 200:
 				raise snscrape.base.ScraperException(f'Got status code {r.status_code}')
 			response = json.loads(spuriousForLoopPattern.sub('', r.text))
@@ -308,7 +310,7 @@ class FacebookGroupScraper(FacebookCommonScraper):
 		pageletDataPrefixLength = len('"GroupEntstreamPagelet",')
 		spuriousForLoopPattern = re.compile(r'^for \(;;\);')
 
-		baseUrl = f'https://www.facebook.com/groups/{self._group}/?sorting_setting=CHRONOLOGICAL'
+		baseUrl = f'https://upload.facebook.com/groups/{self._group}/?sorting_setting=CHRONOLOGICAL'
 		r = self._get(baseUrl, headers = headers)
 		if r.status_code == 404:
 			logger.warning('Group does not exist')
@@ -337,7 +339,7 @@ class FacebookGroupScraper(FacebookCommonScraper):
 		while (data := pageletDataPattern.search(r.text).group(0)[pageletDataPrefixLength:]):
 			# As on the user profile pages, the web app sends a lot of additional parameters, but those all seem to be unnecessary (although some change the response format, e.g. from JSON to HTML)
 			r = self._get(
-				f'https://www.facebook.com/ajax/pagelet/generic.php/GroupEntstreamPagelet',
+				f'https://upload.facebook.com/ajax/pagelet/generic.php/GroupEntstreamPagelet',
 				params = {'data': data, '__a': 1},
 				headers = headers,
 			  )

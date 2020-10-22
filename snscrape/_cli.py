@@ -1,14 +1,16 @@
 import argparse
+import collections
 import contextlib
+import dataclasses
 import datetime
 import inspect
-import json
 import logging
-import requests.models
+import requests
 # Imported in parse_args() after setting up the logger:
 #import snscrape.base
 #import snscrape.modules
 #import snscrape.version
+import sys
 import tempfile
 
 
@@ -42,23 +44,24 @@ class Logger(logging.Logger):
 			super().log(level, *args, **kwargs)
 
 
-def _requests_preparedrequest_repr(name, request):
+def _requests_request_repr(name, request):
 	ret = []
-	ret.append(repr(request))
+	ret.append(f'{name} = {request!r}')
 	ret.append(f'\n  {name}.method = {request.method}')
 	ret.append(f'\n  {name}.url = {request.url}')
 	ret.append(f'\n  {name}.headers = \\')
 	for field in request.headers:
 		ret.append(f'\n    {field} = {_repr("_", request.headers[field])}')
-	if request.body:
-		ret.append(f'\n  {name}.body = ')
-		ret.append(_repr('_', request.body).replace('\n', '\n  '))
+	for attr in ('body', 'params', 'data'):
+		if hasattr(request, attr) and getattr(request, attr):
+			ret.append(f'\n  {name}.{attr} = ')
+			ret.append(_repr('_', getattr(request, attr)).replace('\n', '\n  '))
 	return ''.join(ret)
 
 
 def _requests_response_repr(name, response, withHistory = True):
 	ret = []
-	ret.append(repr(response))
+	ret.append(f'{name} = {response!r}')
 	ret.append(f'\n  {name}.url = {response.url}')
 	ret.append(f'\n  {name}.request = ')
 	ret.append(_repr('_', response.request).replace('\n', '\n  '))
@@ -77,11 +80,20 @@ def _requests_response_repr(name, response, withHistory = True):
 
 
 def _repr(name, value):
-	if type(value) is requests.models.Response:
+	if type(value) is requests.Response:
 		return _requests_response_repr(name, value)
-	if type(value) is requests.models.PreparedRequest:
-		return _requests_preparedrequest_repr(name, value)
-	valueRepr = repr(value)
+	if type(value) in (requests.PreparedRequest, requests.Request):
+		return _requests_request_repr(name, value)
+	if isinstance(value, dict):
+		return f'{name} = <{type(value).__module__}.{type(value).__name__}>\n  ' + \
+		       '\n  '.join(_repr(f'{name}[{k!r}]', v).replace('\n', '\n  ') for k, v in value.items())
+	if isinstance(value, (list, tuple, collections.deque)) and not all(isinstance(v, (int, str)) for v in value):
+		return f'{name} = <{type(value).__module__}.{type(value).__name__}>\n  ' + \
+		       '\n  '.join(_repr(f'{name}[{i}]', v).replace('\n', '\n  ') for i, v in enumerate(value))
+	if dataclasses.is_dataclass(value):
+		return f'{name} = <{type(value).__module__}.{type(value).__name__}>\n  ' + \
+		       '\n  '.join(_repr(f'{name}.{f.name}', f.name) + ' = ' + _repr(f'{name}.{f.name}', getattr(value, f.name)).replace('\n', '\n  ') for f in dataclasses.fields(value))
+	valueRepr = f'{name} = {value!r}'
 	if '\n' in valueRepr:
 		return ''.join(['\\\n  ', valueRepr.replace('\n', '\n  ')])
 	return valueRepr
@@ -155,6 +167,22 @@ def parse_datetime_arg(arg):
 	raise argparse.ArgumentTypeError(f'Cannot parse {arg!r} into a datetime object')
 
 
+def parse_format(arg):
+	# Replace '{' by '{0.' to use properties of the item, but keep '{{' intact
+	parts = arg.split('{')
+	out = ''
+	it = iter(zip(parts, parts[1:]))
+	for part, nextPart in it:
+		out += part
+		if nextPart == '': # Double brace
+			out += '{{'
+			next(it)
+		else: # Single brace
+			out += '{0.'
+	out += parts[-1]
+	return out
+
+
 def parse_args():
 	import snscrape.base
 	import snscrape.modules
@@ -168,12 +196,13 @@ def parse_args():
 		help = 'When the connection fails or the server returns an unexpected response, retry up to N times with an exponential backoff')
 	parser.add_argument('-n', '--max-results', dest = 'maxResults', type = lambda x: int(x) if int(x) >= 0 else parser.error('--max-results N must be zero or positive'), metavar = 'N', help = 'Only return the first N results')
 	group = parser.add_mutually_exclusive_group(required = False)
-	group.add_argument('-f', '--format', dest = 'format', type = str, default = None, help = 'Output format')
+	group.add_argument('-f', '--format', dest = 'format', type = parse_format, default = None, help = 'Output format')
 	group.add_argument('--jsonl', dest = 'jsonl', action = 'store_true', default = False, help = 'Output JSONL')
 	parser.add_argument('--with-entity', dest = 'withEntity', action = 'store_true', default = False, help = 'Include the entity (e.g. user, channel) as the first output item')
 	parser.add_argument('--since', type = parse_datetime_arg, metavar = 'DATETIME', help = 'Only return results newer than DATETIME')
+	parser.add_argument('--progress', action = 'store_true', default = False, help = 'Report progress on stderr')
 
-	subparsers = parser.add_subparsers(dest = 'scraper', help = 'The scraper you want to use')
+	subparsers = parser.add_subparsers(dest = 'scraper', help = 'The scraper you want to use', required = True)
 	classes = snscrape.base.Scraper.__subclasses__()
 	for cls in classes:
 		if cls.name is not None:
@@ -183,10 +212,6 @@ def parse_args():
 		classes.extend(cls.__subclasses__())
 
 	args = parser.parse_args()
-
-	# http://bugs.python.org/issue16308 / https://bugs.python.org/issue26510 (fixed in Python 3.7)
-	if not args.scraper:
-		raise RuntimeError('Error: no scraper specified')
 
 	if not args.withEntity and args.maxResults == 0:
 		parser.error('--max-results 0 is only valid when used with --with-entity')
@@ -226,26 +251,6 @@ def configure_logging(verbosity, dumpLocals_):
 	rootLogger.addHandler(handler)
 
 
-def json_serialise_datetime(obj):
-	if isinstance(obj, (datetime.datetime, datetime.date)):
-		return obj.isoformat()
-	raise TypeError(f'Object of type {type(obj)} is not JSON serializable')
-
-
-def namedtuple_to_dict_recursive(obj):
-	# Convert a NamedTuple to a dict; also converts NamedTuples in its values to dicts
-	if (isinstance(obj, tuple) and hasattr(obj, '_asdict')) or isinstance(obj, dict):
-		if isinstance(obj, tuple):
-			obj = obj._asdict()
-		for key, value in obj.items():
-			obj[key] = namedtuple_to_dict_recursive(value)
-		return obj
-	elif isinstance(obj, (tuple, list)):
-		return type(obj)(namedtuple_to_dict_recursive(value) for value in obj)
-	else:
-		return obj
-
-
 def main():
 	setup_logging()
 	args = parse_args()
@@ -256,7 +261,7 @@ def main():
 	with _dump_locals_on_exception():
 		if args.withEntity and (entity := scraper.entity):
 			if args.jsonl:
-				print(json.dumps(namedtuple_to_dict_recursive(entity), default = json_serialise_datetime))
+				print(entity.json())
 			else:
 				print(entity)
 		if args.maxResults == 0:
@@ -267,13 +272,19 @@ def main():
 				logger.info(f'Exiting due to reaching older results than {args.since}')
 				break
 			if args.jsonl:
-				print(json.dumps(namedtuple_to_dict_recursive(item), default = json_serialise_datetime))
+				print(item.json())
 			elif args.format is not None:
-				print(args.format.format(**item._asdict()))
+				print(args.format.format(item))
 			else:
 				print(item)
+			if args.progress and i % 100 == 0:
+				print(f'Scraping, {i} results so far', file = sys.stderr)
 			if args.maxResults and i >= args.maxResults:
 				logger.info(f'Exiting after {i} results')
+				if args.progress:
+					print(f'Stopped scraping after {i} results due to --max-results', file = sys.stderr)
 				break
 		else:
 			logger.info(f'Done, found {i} results')
+			if args.progress:
+				print(f'Finished, {i} results', file = sys.stderr)

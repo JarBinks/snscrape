@@ -1,4 +1,5 @@
 import bs4
+import dataclasses
 import datetime
 import email.utils
 import itertools
@@ -17,18 +18,16 @@ logger = logging.getLogger(__name__)
 _API_AUTHORIZATION_HEADER = 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA'
 
 
-class Tweet(typing.NamedTuple, snscrape.base.Item):
+@dataclasses.dataclass
+class Tweet(snscrape.base.Item):
 	url: str
 	date: datetime.datetime
 	content: str
 	renderedContent: str
 	id: int
-	username: str # Deprecated, use user['username'] instead
 	user: 'User'
 	outlinks: list
-	outlinksss: str # Deprecated, use outlinks instead
 	tcooutlinks: list
-	tcooutlinksss: str # Deprecated, use tcooutlinks instead
 	replyCount: int
 	retweetCount: int
 	likeCount: int
@@ -41,6 +40,10 @@ class Tweet(typing.NamedTuple, snscrape.base.Item):
 	quotedTweet: typing.Optional['Tweet'] = None
 	mentionedUsers: typing.Optional[typing.List['User']] = None
 
+	username = snscrape.base._DeprecatedProperty('username', lambda self: self.user.username, 'user.username')
+	outlinksss = snscrape.base._DeprecatedProperty('outlinksss', lambda self: ' '.join(self.outlinks), 'outlinks')
+	tcooutlinksss = snscrape.base._DeprecatedProperty('tcooutlinksss', lambda self: ' '.join(self.tcooutlinks), 'tcooutlinks')
+
 	def __str__(self):
 		return self.url
 
@@ -49,39 +52,45 @@ class Medium:
 	pass
 
 
-class Photo(typing.NamedTuple, Medium):
+@dataclasses.dataclass
+class Photo(Medium):
 	previewUrl: str
 	fullUrl: str
 	type: str = 'photo'
 
 
-class VideoVariant(typing.NamedTuple):
+@dataclasses.dataclass
+class VideoVariant:
 	contentType: str
 	url: str
 	bitrate: typing.Optional[int]
 
 
-class Video(typing.NamedTuple, Medium):
+@dataclasses.dataclass
+class Video(Medium):
 	thumbnailUrl: str
 	variants: typing.List[VideoVariant]
 	duration: float
 	type: str = 'video'
 
 
-class Gif(typing.NamedTuple, Medium):
+@dataclasses.dataclass
+class Gif(Medium):
 	thumbnailUrl: str
 	variants: typing.List[VideoVariant]
 	type: str = 'gif'
 
 
-class DescriptionURL(typing.NamedTuple):
+@dataclasses.dataclass
+class DescriptionURL:
 	text: str
 	url: str
 	tcourl: str
 	indices: typing.Tuple[int, int]
 
 
-class User(typing.NamedTuple, snscrape.base.Entity):
+@dataclasses.dataclass
+class User(snscrape.base.Entity):
 	# Most fields can be None if they're not known.
 
 	username: str
@@ -294,14 +303,11 @@ class TwitterAPIScraper(snscrape.base.Scraper):
 		kwargs['id'] = tweet['id'] if 'id' in tweet else int(tweet['id_str'])
 		kwargs['content'] = tweet['full_text']
 		kwargs['renderedContent'] = self._render_text_with_urls(tweet['full_text'], tweet['entities'].get('urls'))
-		kwargs['username'] = obj['globalObjects']['users'][tweet['user_id_str']]['screen_name']
 		kwargs['user'] = self._user_to_user(obj['globalObjects']['users'][tweet['user_id_str']])
 		kwargs['date'] = email.utils.parsedate_to_datetime(tweet['created_at'])
 		kwargs['outlinks'] = [u['expanded_url'] for u in tweet['entities']['urls']] if 'urls' in tweet['entities'] else []
-		kwargs['outlinksss'] = ' '.join(kwargs['outlinks'])
 		kwargs['tcooutlinks'] = [u['url'] for u in tweet['entities']['urls']] if 'urls' in tweet['entities'] else []
-		kwargs['tcooutlinksss'] = ' '.join(kwargs['tcooutlinks'])
-		kwargs['url'] = f'https://twitter.com/{kwargs["username"]}/status/{kwargs["id"]}'
+		kwargs['url'] = f'https://twitter.com/{obj["globalObjects"]["users"][tweet["user_id_str"]]["screen_name"]}/status/{kwargs["id"]}'
 		kwargs['replyCount'] = tweet['reply_count']
 		kwargs['retweetCount'] = tweet['retweet_count']
 		kwargs['likeCount'] = tweet['favorite_count']

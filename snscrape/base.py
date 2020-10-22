@@ -1,14 +1,54 @@
 import abc
+import dataclasses
+import datetime
 import functools
+import json
 import logging
 import requests
 import time
+import warnings
 
 
 logger = logging.getLogger(__name__)
 
 
-class Item:
+class _DeprecatedProperty:
+	def __init__(self, name, repl, replStr):
+		self.name = name
+		self.repl = repl
+		self.replStr = replStr
+
+	def __get__(self, obj, objType):
+		warnings.warn(f'{self.name} is deprecated, use {self.replStr} instead', FutureWarning, stacklevel = 2)
+		return self.repl(obj)
+
+
+def _json_serialise_datetime(obj):
+	'''A JSON serialiser that converts datetime.datetime and datetime.date objects to ISO-8601 strings.'''
+	if isinstance(obj, (datetime.datetime, datetime.date)):
+		return obj.isoformat()
+	raise TypeError(f'Object of type {type(obj)} is not JSON serializable')
+
+
+@dataclasses.dataclass
+class _JSONDataclass:
+	'''A base class for dataclasses for conversion to JSON'''
+
+	def json(self):
+		'''Convert the object to a JSON string'''
+		out = dataclasses.asdict(self)
+		for key, value in list(out.items()): # Modifying the dict below, so make a copy first
+			if isinstance(value, _JSONDataclass):
+				out[key] = value.json()
+			elif isinstance(value, IntWithGranularity):
+				out[key] = int(value)
+				assert f'{key}.granularity' not in out, f'Granularity collision on {key}.granularity'
+				out[f'{key}.granularity'] = value.granularity
+		return json.dumps(out, default = _json_serialise_datetime)
+
+
+@dataclasses.dataclass
+class Item(_JSONDataclass):
 	'''An abstract base class for an item returned by the scraper's get_items generator.
 
 	An item can really be anything. The string representation should be useful for the CLI output (e.g. a direct URL for the item).'''
@@ -18,7 +58,8 @@ class Item:
 		pass
 
 
-class Entity:
+@dataclasses.dataclass
+class Entity(_JSONDataclass):
 	'''An abstract base class for an entity returned by the scraper's entity property.
 
 	An entity is typically the account of a person or organisation. The string representation should be the preferred direct URL to the entity's page on the network.'''
@@ -28,10 +69,18 @@ class Entity:
 		pass
 
 
-Granularity = int
-'''Type of fields storing the unit/granularity of numbers.
+class IntWithGranularity(int):
+	'''A number with an associated granularity
 
-For example, a granularity of 1000 means that the SNS returned something like '42k' and the last three significant digits are unknown.'''
+	For example, an IntWithGranularity(42000, 1000) represents a number on the order of 42000 with two significant digits, i.e. something counted with a granularity of 1000.'''
+
+	def __new__(cls, value, granularity, *args, **kwargs):
+		obj = super().__new__(cls, value, *args, **kwargs)
+		obj.granularity = granularity
+		return obj
+
+	def __reduce__(self):
+		return (IntWithGranularity, (int(self), self.granularity))
 
 
 class URLItem(Item):
@@ -89,7 +138,7 @@ class Scraper:
 			except requests.exceptions.RequestException as exc:
 				if attempt < self._retries:
 					retrying = ', retrying'
-					level = logging.WARNING
+					level = logging.INFO
 				else:
 					retrying = ''
 					level = logging.ERROR
@@ -107,7 +156,7 @@ class Scraper:
 				else:
 					if attempt < self._retries:
 						retrying = ', retrying'
-						level = logging.WARNING
+						level = logging.INFO
 					else:
 						retrying = ''
 						level = logging.ERROR
